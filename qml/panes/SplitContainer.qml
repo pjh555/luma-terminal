@@ -23,7 +23,12 @@ Item {
     Component.onCompleted: clampRatio()
     onWidthChanged: clampRatio()
     onHeightChanged: clampRatio()
-    onRatioChanged: if (node) node.ratio = ratio
+    onRatioChanged: {
+        if (node)
+            node.ratio = ratio
+        if (windowRoot)
+            windowRoot.scheduleSessionSave()
+    }
 
     Item {
         id: first

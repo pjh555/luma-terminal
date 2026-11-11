@@ -3,12 +3,15 @@
 
 #include <QClipboard>
 #include <QDebug>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QSet>
 #include <QSocketNotifier>
 #include <QUrl>
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <cstring>
@@ -61,6 +64,11 @@ TerminalSession::TerminalSession(const QString &id, QObject *parent)
     m_cwdTimer = new QTimer(this);
     m_cwdTimer->setInterval(1200);
     connect(m_cwdTimer, &QTimer::timeout, this, &TerminalSession::pollCwd);
+
+    m_imageTimer = new QTimer(this);
+    m_imageTimer->setSingleShot(true);
+    connect(m_imageTimer, &QTimer::timeout, this, [this] { refreshSnapshot(); });
+    m_animationClock.start();
 
     connect(Theme::instance(), &Theme::themeChanged, this, [this] {
         if (!m_terminal)
@@ -167,6 +175,18 @@ void TerminalSession::createTerminal()
     bool cursorBlink = true;
     ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_DEFAULT_CURSOR_BLINK, &cursorBlink);
 
+    // Kitty graphics: keep the last 128 MiB of decoded images per screen and
+    // accept the temp-file and shared-memory transfer mediums used by tools
+    // such as kitty's icat. Arbitrary file paths stay disabled.
+    const uint64_t imageLimit = 128ull * 1024ull * 1024ull;
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &imageLimit);
+    bool sharedMemory = true;
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_SHARED_MEM, &sharedMemory);
+    const QByteArray tempDirBytes = QFile::encodeName(QDir::tempPath());
+    GhosttyString tempDir{reinterpret_cast<const uint8_t *>(tempDirBytes.constData()),
+                          static_cast<size_t>(tempDirBytes.size())};
+    ghostty_terminal_set(m_terminal, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_MEDIUM_TEMP_FILE, &tempDir);
+
     applyColors();
 
     ghostty_terminal_resize(m_terminal, static_cast<uint16_t>(m_cols),
@@ -176,7 +196,8 @@ void TerminalSession::createTerminal()
 
     if (ghostty_render_state_new(nullptr, &m_renderState) != GHOSTTY_SUCCESS
         || ghostty_render_state_row_iterator_new(nullptr, &m_rowIter) != GHOSTTY_SUCCESS
-        || ghostty_render_state_row_cells_new(nullptr, &m_cells) != GHOSTTY_SUCCESS) {
+        || ghostty_render_state_row_cells_new(nullptr, &m_cells) != GHOSTTY_SUCCESS
+        || ghostty_render_state_image_iterator_new(nullptr, &m_imageIter) != GHOSTTY_SUCCESS) {
         qWarning() << "libghostty-vt: failed to create render state";
     }
 
@@ -197,6 +218,7 @@ void TerminalSession::createTerminal()
 void TerminalSession::destroyTerminal()
 {
     m_updateTimer->stop();
+    m_imageTimer->stop();
 
     if (m_search) {
         ghostty_search_free(m_search);
@@ -222,10 +244,15 @@ void TerminalSession::destroyTerminal()
         ghostty_render_state_row_cells_free(m_cells);
         m_cells = nullptr;
     }
+    if (m_imageIter) {
+        ghostty_render_state_image_iterator_free(m_imageIter);
+        m_imageIter = nullptr;
+    }
     if (m_rowIter) {
         ghostty_render_state_row_iterator_free(m_rowIter);
         m_rowIter = nullptr;
     }
+    m_imageCache.clear();
     if (m_renderState) {
         ghostty_render_state_free(m_renderState);
         m_renderState = nullptr;
@@ -279,6 +306,9 @@ void TerminalSession::setupPty()
     ws.ws_row = static_cast<unsigned short>(m_rows);
     ws.ws_col = static_cast<unsigned short>(m_cols);
 
+    const QByteArray initialCwdBytes = m_initialCwd.toLocal8Bit();
+    const QByteArray homeBytes = QDir::homePath().toLocal8Bit();
+
     int master = -1;
     int slave = -1;
     if (::openpty(&master, &slave, nullptr, nullptr, &ws) < 0) {
@@ -311,6 +341,11 @@ void TerminalSession::setupPty()
         ::setenv("TERM_PROGRAM", "Luma", 1);
         ::setenv("TERM_PROGRAM_VERSION", LUMA_VERSION, 1);
         ::unsetenv("VTE_VERSION");
+
+        if (!initialCwdBytes.isEmpty() && ::chdir(initialCwdBytes.constData()) != 0) {
+            const int homeResult = ::chdir(homeBytes.constData());
+            Q_UNUSED(homeResult);
+        }
 
         const QByteArray shell = m_shellPath.toLocal8Bit();
         const QByteArray arg0 = m_shellName.toLocal8Bit();
@@ -545,6 +580,25 @@ void TerminalSession::refreshSnapshot()
 
     Snapshot old = m_snapshot;
 
+    // Advance Kitty animations before taking the render snapshot so the image
+    // generation we cache matches the pixels the render state reports.
+    GhosttyKittyGraphics graphics = nullptr;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics)
+        == GHOSTTY_SUCCESS) {
+        uint64_t nextFrameMs = 0;
+        if (ghostty_kitty_graphics_animation_tick(graphics, m_animationClock.elapsed(),
+                                                  &nextFrameMs)
+            == GHOSTTY_SUCCESS) {
+            const qint64 delay = qBound<qint64>(qint64(8),
+                                                static_cast<qint64>(nextFrameMs)
+                                                    - m_animationClock.elapsed(),
+                                                qint64(60000));
+            m_imageTimer->start(static_cast<int>(delay));
+        } else if (m_imageTimer->isActive()) {
+            m_imageTimer->stop();
+        }
+    }
+
     ghostty_render_state_update(m_renderState, m_terminal);
 
     uint16_t cols = 0;
@@ -677,6 +731,98 @@ void TerminalSession::refreshSnapshot()
         }
     }
 
+    next.images.clear();
+    if (m_imageIter
+        && ghostty_render_state_get(m_renderState,
+                                    GHOSTTY_RENDER_STATE_DATA_IMAGE_ITERATOR,
+                                    &m_imageIter) == GHOSTTY_SUCCESS) {
+        QSet<quint32> seenImages;
+        while (ghostty_render_state_image_iterator_next(m_imageIter)) {
+            GhosttyImageProtocol protocol = GHOSTTY_IMAGE_PROTOCOL_KITTY;
+            uint32_t imageId = 0;
+            uint64_t generation = 0;
+            GhosttyRenderStateImageLayer layer = GHOSTTY_RENDER_STATE_IMAGE_LAYER_BELOW_TEXT;
+            int32_t z = 0;
+            int32_t col = 0;
+            int32_t row = 0;
+            uint32_t offsetX = 0;
+            uint32_t offsetY = 0;
+            uint32_t pixelWidth = 0;
+            uint32_t pixelHeight = 0;
+            uint32_t sourceX = 0;
+            uint32_t sourceY = 0;
+            uint32_t sourceWidth = 0;
+            uint32_t sourceHeight = 0;
+
+            const GhosttyRenderStateImageData keys[] = {
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_PROTOCOL,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_ID,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_IMAGE_GENERATION,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_LAYER,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_Z,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_COL,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_VIEWPORT_ROW,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_X,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_CELL_OFFSET_Y,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_WIDTH,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_PIXEL_HEIGHT,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_X,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_Y,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_WIDTH,
+                GHOSTTY_RENDER_STATE_IMAGE_DATA_SOURCE_HEIGHT,
+            };
+            void *values[] = {
+                &protocol, &imageId, &generation, &layer, &z, &col, &row,
+                &offsetX, &offsetY, &pixelWidth, &pixelHeight,
+                &sourceX, &sourceY, &sourceWidth, &sourceHeight,
+            };
+            if (ghostty_render_state_image_get_multi(
+                    m_imageIter, sizeof(keys) / sizeof(keys[0]), keys, values, nullptr)
+                != GHOSTTY_SUCCESS) {
+                continue;
+            }
+            if (protocol != GHOSTTY_IMAGE_PROTOCOL_KITTY || imageId == 0
+                || pixelWidth == 0 || pixelHeight == 0) {
+                continue;
+            }
+
+            ImagePlacement placement;
+            placement.imageId = imageId;
+            placement.generation = generation;
+            placement.layer = static_cast<int>(layer);
+            placement.z = z;
+            placement.col = col;
+            placement.row = row;
+            placement.offsetX = static_cast<int>(offsetX);
+            placement.offsetY = static_cast<int>(offsetY);
+            placement.pixelWidth = static_cast<int>(pixelWidth);
+            placement.pixelHeight = static_cast<int>(pixelHeight);
+            placement.sourceRect = QRect(static_cast<int>(sourceX), static_cast<int>(sourceY),
+                                         static_cast<int>(sourceWidth),
+                                         static_cast<int>(sourceHeight));
+            placement.image = kittyImage(imageId, generation);
+            if (placement.image.isNull())
+                continue;
+
+            seenImages.insert(imageId);
+            next.images.append(placement);
+        }
+
+        for (auto it = m_imageCache.begin(); it != m_imageCache.end();) {
+            if (!seenImages.contains(it.key()))
+                it = m_imageCache.erase(it);
+            else
+                ++it;
+        }
+    }
+
+    std::stable_sort(next.images.begin(), next.images.end(),
+                     [](const ImagePlacement &a, const ImagePlacement &b) {
+                         if (a.layer != b.layer)
+                             return a.layer < b.layer;
+                         return a.z < b.z;
+                     });
+
     GhosttyRenderStateCursor cursor = GHOSTTY_INIT_SIZED(GhosttyRenderStateCursor);
     if (ghostty_render_state_get(m_renderState,
                                  GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor)
@@ -715,6 +861,97 @@ void TerminalSession::refreshSnapshot()
 
     m_snapshot = next;
     emitStateChanges(old);
+}
+
+QImage TerminalSession::kittyImage(quint32 imageId, quint64 generation)
+{
+    const auto cached = m_imageCache.constFind(imageId);
+    if (cached != m_imageCache.constEnd() && cached->generation == generation)
+        return cached->image;
+
+    if (!m_terminal)
+        return {};
+
+    GhosttyKittyGraphics graphics = nullptr;
+    if (ghostty_terminal_get(m_terminal, GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS, &graphics)
+            != GHOSTTY_SUCCESS
+        || !graphics) {
+        return {};
+    }
+
+    GhosttyKittyGraphicsImage image = ghostty_kitty_graphics_image(graphics, imageId);
+    if (!image)
+        return {};
+
+    uint32_t width = 0;
+    uint32_t height = 0;
+    GhosttyKittyImageFormat format = GHOSTTY_KITTY_IMAGE_FORMAT_RGBA;
+    const uint8_t *pixels = nullptr;
+    size_t dataLen = 0;
+    if (ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &width)
+            != GHOSTTY_SUCCESS
+        || ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &height)
+            != GHOSTTY_SUCCESS
+        || ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &format)
+            != GHOSTTY_SUCCESS
+        || ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR, &pixels)
+            != GHOSTTY_SUCCESS
+        || ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &dataLen)
+            != GHOSTTY_SUCCESS
+        || !pixels || width == 0 || height == 0) {
+        return {};
+    }
+
+    QImage decoded;
+    const int w = static_cast<int>(width);
+    const int h = static_cast<int>(height);
+    switch (format) {
+    case GHOSTTY_KITTY_IMAGE_FORMAT_RGBA: {
+        const qsizetype stride = static_cast<qsizetype>(w) * 4;
+        if (dataLen < static_cast<size_t>(stride) * static_cast<size_t>(h))
+            return {};
+        decoded = QImage(pixels, w, h, stride, QImage::Format_RGBA8888).copy();
+        break;
+    }
+    case GHOSTTY_KITTY_IMAGE_FORMAT_RGB: {
+        const qsizetype stride = static_cast<qsizetype>(w) * 3;
+        if (dataLen < static_cast<size_t>(stride) * static_cast<size_t>(h))
+            return {};
+        decoded = QImage(pixels, w, h, stride, QImage::Format_RGB888).copy();
+        break;
+    }
+    case GHOSTTY_KITTY_IMAGE_FORMAT_GRAY: {
+        const qsizetype stride = w;
+        if (dataLen < static_cast<size_t>(stride) * static_cast<size_t>(h))
+            return {};
+        decoded = QImage(pixels, w, h, stride, QImage::Format_Grayscale8).copy();
+        break;
+    }
+    case GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA: {
+        if (dataLen < static_cast<size_t>(w) * static_cast<size_t>(h) * 2)
+            return {};
+        decoded = QImage(w, h, QImage::Format_RGBA8888);
+        for (int y = 0; y < h; ++y) {
+            auto *dst = decoded.scanLine(y);
+            const uint8_t *src = pixels + static_cast<size_t>(y) * static_cast<size_t>(w) * 2;
+            for (int x = 0; x < w; ++x) {
+                dst[x * 4 + 0] = src[x * 2 + 0];
+                dst[x * 4 + 1] = src[x * 2 + 0];
+                dst[x * 4 + 2] = src[x * 2 + 0];
+                dst[x * 4 + 3] = src[x * 2 + 1];
+            }
+        }
+        break;
+    }
+    default:
+        return {};
+    }
+
+    if (decoded.isNull())
+        return {};
+
+    m_imageCache.insert(imageId, CachedImage{generation, decoded});
+    return decoded;
 }
 
 void TerminalSession::buildSearchHighlights(Snapshot &snapshot)
@@ -1438,6 +1675,14 @@ void TerminalSession::setShellPath(const QString &path)
         return;
     m_shellPath = info.absoluteFilePath();
     m_shellName = info.fileName();
+}
+
+void TerminalSession::setInitialCwd(const QString &path)
+{
+    if (m_running)
+        return;
+    const QFileInfo info(path);
+    m_initialCwd = (info.exists() && info.isDir()) ? info.absoluteFilePath() : QString();
 }
 
 void TerminalSession::setScrollbackLines(int lines)

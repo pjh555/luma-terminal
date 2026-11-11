@@ -87,12 +87,18 @@ void TerminalManager::resetSettings()
 
 QString TerminalManager::createSession()
 {
+    return createSessionAt(QString());
+}
+
+QString TerminalManager::createSessionAt(const QString &cwd)
+{
     QString id = QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
     while (m_sessions.contains(id))
         id = QUuid::createUuid().toString(QUuid::WithoutBraces).left(8);
 
     auto *session = new TerminalSession(id, this);
     session->setShellPath(m_shellPath);
+    session->setInitialCwd(cwd);
     session->setScrollbackLines(m_scrollbackLines);
     m_sessions.insert(id, session);
 

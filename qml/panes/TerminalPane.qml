@@ -171,6 +171,7 @@ Rectangle {
         anchors.bottom: parent.bottom
         session: pane.session
         fontSize: pane.windowRoot ? pane.windowRoot.terminalFontSize : 13
+        ligatures: pane.windowRoot ? pane.windowRoot.ligatures : true
         active: pane.isActive
 
         onActivated: pane.windowRoot.focusPane(pane.paneId)

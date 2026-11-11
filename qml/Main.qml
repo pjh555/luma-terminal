@@ -37,6 +37,9 @@ ApplicationWindow {
     readonly property bool overlayOpen: paletteOpen || helpOpen || settingsOpen || renameOpen
     property var demoPanes: []
     property var paneTitles: ({})
+    property var paneInitialCwd: ({})
+    property int tabDropSlot: -1
+    property bool ligatures: true
 
     Settings {
         id: appSettings
@@ -44,6 +47,13 @@ ApplicationWindow {
         property int fontSize: 13
         property int winWidth: 1280
         property int winHeight: 840
+        property bool ligatures: true
+    }
+
+    Settings {
+        id: sessionSettings
+        category: "session"
+        property string layout: ""
     }
 
     function shortCwd(path) {
@@ -175,6 +185,7 @@ ApplicationWindow {
         window.title = (active && active.displayTitle.length > 0
                         ? active.displayTitle + " — "
                         : "") + "Luma 终端"
+        scheduleSessionSave()
     }
 
     function updateActiveRefs() {
@@ -229,8 +240,10 @@ ApplicationWindow {
         closeSearch()
         const tab = tabs[index]
         const panes = collectPanes(tab.root, [])
-        for (let i = 0; i < panes.length; ++i)
+        for (let i = 0; i < panes.length; ++i) {
             Terminal.closeSession(panes[i])
+            delete paneInitialCwd[panes[i]]
+        }
 
         const next = tabs.slice()
         next.splice(index, 1)
@@ -296,6 +309,7 @@ ApplicationWindow {
         }
         tab.root = newRoot
         Terminal.closeSession(paneId)
+        delete paneInitialCwd[paneId]
         const remaining = collectPanes(newRoot, [])
         tab.focus = remaining.length > 0 ? remaining[0] : ""
         activePaneId = tab.focus
@@ -412,6 +426,148 @@ ApplicationWindow {
         tabs = next
         currentTab = next.indexOf(activeTabObject)
         updateTabTitles()
+    }
+
+    // Move a tab to an insertion slot (0..tabs.length) using stable tab ids,
+    // so drag-and-drop survives index changes while the drag is active.
+    function moveTabTo(tabId, slot) {
+        let from = -1
+        for (let i = 0; i < tabs.length; ++i) {
+            if (tabs[i].id === tabId) {
+                from = i
+                break
+            }
+        }
+        if (from < 0)
+            return
+        slot = Math.max(0, Math.min(tabs.length, slot))
+        let to = slot > from ? slot - 1 : slot
+        to = Math.max(0, Math.min(tabs.length - 1, to))
+        tabDropSlot = -1
+        if (to === from)
+            return
+        const activeTabObject = tabs[currentTab]
+        const next = tabs.slice()
+        const item = next.splice(from, 1)[0]
+        next.splice(to, 0, item)
+        tabs = next
+        currentTab = next.indexOf(activeTabObject)
+        updateTabTitles()
+        scheduleSessionSave()
+    }
+
+    function buildSessionTree(node) {
+        if (!node)
+            return null
+        if (node.type === "leaf") {
+            const session = Terminal.session(node.pane)
+            let cwd = session ? session.cwd : ""
+            if (!cwd)
+                cwd = paneInitialCwd[node.pane] || ""
+            return { type: "leaf", cwd: cwd }
+        }
+        return {
+            type: "split",
+            orientation: node.orientation,
+            ratio: node.ratio,
+            first: buildSessionTree(node.first),
+            second: buildSessionTree(node.second)
+        }
+    }
+
+    function saveSession() {
+        if (demoMode || screenshotMode)
+            return
+        if (tabs.length === 0) {
+            sessionSettings.layout = ""
+            return
+        }
+        const savedTabs = []
+        for (let i = 0; i < tabs.length; ++i) {
+            const tab = tabs[i]
+            const panes = collectPanes(tab.root, [])
+            savedTabs.push({
+                title: tab.customTitle || "",
+                focus: Math.max(0, panes.indexOf(tab.focus)),
+                tree: buildSessionTree(tab.root)
+            })
+        }
+        sessionSettings.layout = JSON.stringify({
+            current: currentTab,
+            tabs: savedTabs
+        })
+    }
+
+    function scheduleSessionSave() {
+        if (demoMode || screenshotMode)
+            return
+        sessionSaveTimer.restart()
+    }
+
+    function restoreSessionTree(node, ids) {
+        if (!node)
+            return null
+        if (node.type === "leaf") {
+            const cwd = node.cwd || ""
+            const id = Terminal.createSessionAt(cwd)
+            paneInitialCwd[id] = cwd
+            ids.push(id)
+            return { type: "leaf", pane: id }
+        }
+        return {
+            type: "split",
+            orientation: node.orientation === "column" ? "column" : "row",
+            ratio: typeof node.ratio === "number" ? node.ratio : 0.5,
+            first: restoreSessionTree(node.first, ids),
+            second: restoreSessionTree(node.second, ids)
+        }
+    }
+
+    function restoreSession() {
+        if (!sessionSettings.layout)
+            return false
+        let data = null
+        try {
+            data = JSON.parse(sessionSettings.layout)
+        } catch (error) {
+            return false
+        }
+        if (!data || !Array.isArray(data.tabs) || data.tabs.length === 0)
+            return false
+
+        const restored = []
+        for (let i = 0; i < data.tabs.length; ++i) {
+            const saved = data.tabs[i]
+            if (!saved || !saved.tree)
+                continue
+            const ids = []
+            const root = restoreSessionTree(saved.tree, ids)
+            if (!root || ids.length === 0)
+                continue
+            const focus = Math.max(0, Math.min(ids.length - 1,
+                                            Number(saved.focus) || 0))
+            restored.push({
+                id: ids[focus],
+                root: root,
+                focus: ids[focus],
+                customTitle: saved.title || "",
+                displayTitle: "~",
+                subtitle: "",
+                paneCount: ids.length,
+                shellName: Terminal.shellName
+            })
+        }
+        if (restored.length === 0)
+            return false
+
+        tabs = restored
+        currentTab = Math.max(0, Math.min(restored.length - 1,
+                                         Number(data.current) || 0))
+        activePaneId = restored[currentTab].focus
+        updateTabTitles()
+        updateActiveRefs()
+        layoutRevision++
+        return true
     }
 
     function openSettings() {
@@ -606,8 +762,10 @@ ApplicationWindow {
     }
 
     onTerminalFontSizeChanged: appSettings.fontSize = terminalFontSize
+    onLigaturesChanged: appSettings.ligatures = ligatures
 
     onClosing: {
+        saveSession()
         if (!screenshotMode && visibility !== Window.FullScreen) {
             appSettings.winWidth = width
             appSettings.winHeight = height
@@ -629,15 +787,24 @@ ApplicationWindow {
 
     Component.onCompleted: {
         terminalFontSize = Math.max(8, Math.min(24, appSettings.fontSize))
+        ligatures = appSettings.ligatures
         if (appSettings.winWidth >= minimumWidth)
             width = appSettings.winWidth
         if (appSettings.winHeight >= minimumHeight)
             height = appSettings.winHeight
-        createInitialTab()
+        if (demoMode || screenshotMode || !restoreSession())
+            createInitialTab()
         if (demoMode)
             demoTimer.start()
         if (screenshotUi.length > 0)
             screenshotOverlayTimer.start()
+    }
+
+    Timer {
+        id: sessionSaveTimer
+        interval: 800
+        repeat: false
+        onTriggered: window.saveSession()
     }
 
     Timer {
@@ -879,6 +1046,7 @@ ApplicationWindow {
                     spacing: 3
 
                     Repeater {
+                        id: tabRepeater
                         model: window.tabs
                         delegate: SidebarTab {
                             width: tabsColumn.width
@@ -886,12 +1054,44 @@ ApplicationWindow {
                             tab: modelData
                             tabIndex: index
                             isActive: index === window.currentTab
+                            dropTop: window.tabDropSlot === index
+                            dropBottom: window.tabDropSlot === window.tabs.length
+                                        && index === window.tabs.length - 1
                             onActivated: window.selectTab(index)
                             onCloseRequested: window.closeTab(index)
                             onRenameRequested: window.openRename(index)
                             onMoveUpRequested: window.moveTab(index, -1)
                             onMoveDownRequested: window.moveTab(index, 1)
                         }
+                    }
+                }
+
+                DropArea {
+                    id: tabsDrop
+                    anchors.fill: tabsColumn
+                    keys: ["luma-tab"]
+
+                    function slotAt(y) {
+                        let slot = window.tabs.length
+                        for (let i = 0; i < window.tabs.length; ++i) {
+                            const item = tabRepeater.itemAt(i)
+                            if (item && y < item.y + item.height / 2) {
+                                slot = i
+                                break
+                            }
+                        }
+                        return slot
+                    }
+
+                    onPositionChanged: function(drag) {
+                        window.tabDropSlot = slotAt(drag.y)
+                    }
+                    onExited: window.tabDropSlot = -1
+                    onDropped: function(drop) {
+                        if (!drop.source || !drop.source.tab)
+                            return
+                        window.moveTabTo(drop.source.tab.id, slotAt(drop.y))
+                        window.tabDropSlot = -1
                     }
                 }
             }

@@ -25,6 +25,7 @@ public:
     Q_INVOKABLE void resetSettings();
 
     Q_INVOKABLE QString createSession();
+    Q_INVOKABLE QString createSessionAt(const QString &cwd);
     Q_INVOKABLE TerminalSession *session(const QString &id) const;
     Q_INVOKABLE void closeSession(const QString &id);
     Q_INVOKABLE int sessionCount() const { return m_sessions.size(); }

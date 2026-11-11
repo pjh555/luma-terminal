@@ -16,6 +16,7 @@ class TerminalView : public QQuickPaintedItem
     Q_OBJECT
     Q_PROPERTY(TerminalSession *session READ session WRITE setSession NOTIFY sessionChanged)
     Q_PROPERTY(int fontSize READ fontSize WRITE setFontSize NOTIFY fontSizeChanged)
+    Q_PROPERTY(bool ligatures READ ligatures WRITE setLigatures NOTIFY ligaturesChanged)
     Q_PROPERTY(bool active READ active WRITE setActive NOTIFY activeChanged)
     Q_PROPERTY(bool hasSelection READ hasSelection NOTIFY selectionChanged)
     Q_PROPERTY(int searchMatchCount READ searchMatchCount NOTIFY searchChanged)
@@ -31,6 +32,9 @@ public:
 
     int fontSize() const { return m_fontSize; }
     void setFontSize(int size);
+
+    bool ligatures() const { return m_ligatures; }
+    void setLigatures(bool enabled);
 
     bool active() const { return m_active; }
     void setActive(bool active);
@@ -58,6 +62,7 @@ public:
 signals:
     void sessionChanged();
     void fontSizeChanged();
+    void ligaturesChanged();
     void activeChanged();
     void selectionChanged();
     void searchChanged();
@@ -100,6 +105,8 @@ private:
                          const TerminalSession::Snapshot &snapshot) const;
     QFont fontForCell(const TerminalSession::Cell &cell) const;
 
+    void paintImages(QPainter *painter, const TerminalSession::Snapshot &snapshot,
+                     int layer);
     void paintBackgrounds(QPainter *painter, const TerminalSession::Snapshot &snapshot);
     void paintText(QPainter *painter, const TerminalSession::Snapshot &snapshot);
     void paintCursor(QPainter *painter, const TerminalSession::Snapshot &snapshot);
@@ -107,6 +114,7 @@ private:
 
     QPointer<TerminalSession> m_session;
     int m_fontSize = 13;
+    bool m_ligatures = true;
     bool m_active = false;
 
     QFont m_font;

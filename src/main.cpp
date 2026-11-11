@@ -3,6 +3,7 @@
 #include "TerminalView.h"
 #include "Theme.h"
 
+#include <QDebug>
 #include <QDir>
 #include <QFileInfo>
 #include <QGuiApplication>
@@ -14,6 +15,44 @@
 #include <QQmlContext>
 #include <QQuickStyle>
 #include <QTextStream>
+
+#include <climits>
+#include <cstring>
+
+namespace {
+
+bool decodePng(void *, const GhosttyAllocator *allocator,
+               const uint8_t *data, size_t dataLen, GhosttySysImage *out)
+{
+    if (!data || dataLen == 0 || dataLen > static_cast<size_t>(INT_MAX) || !out)
+        return false;
+
+    QImage image = QImage::fromData(data, static_cast<int>(dataLen), "PNG");
+    if (image.isNull())
+        return false;
+    image = image.convertToFormat(QImage::Format_RGBA8888);
+    if (image.isNull() || image.width() <= 0 || image.height() <= 0)
+        return false;
+
+    const size_t rowBytes = static_cast<size_t>(image.width()) * 4;
+    const size_t totalBytes = rowBytes * static_cast<size_t>(image.height());
+    uint8_t *pixels = ghostty_alloc(allocator, totalBytes);
+    if (!pixels)
+        return false;
+
+    for (int y = 0; y < image.height(); ++y) {
+        std::memcpy(pixels + static_cast<size_t>(y) * rowBytes,
+                    image.constScanLine(y), rowBytes);
+    }
+
+    out->width = static_cast<uint32_t>(image.width());
+    out->height = static_cast<uint32_t>(image.height());
+    out->data = pixels;
+    out->data_len = totalBytes;
+    return true;
+}
+
+} // namespace
 
 int main(int argc, char *argv[])
 {
@@ -37,6 +76,11 @@ int main(int argc, char *argv[])
         QGuiApplication::setWindowIcon(icon);
 
     QQuickStyle::setStyle(QStringLiteral("Basic"));
+
+    if (ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG,
+                        reinterpret_cast<const void *>(&decodePng)) != GHOSTTY_SUCCESS) {
+        qWarning() << "libghostty-vt: failed to install PNG decoder";
+    }
 
     bool demoMode = false;
     QString screenshotPath;

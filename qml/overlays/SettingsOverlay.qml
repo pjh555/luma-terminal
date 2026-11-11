@@ -289,6 +289,67 @@ Item {
                     Text {
                         anchors.left: parent.left
                         anchors.verticalCenter: parent.verticalCenter
+                        text: "编程连字"
+                        color: Theme.textSecondary
+                        font.family: Theme.uiFont
+                        font.pixelSize: 12
+                    }
+
+                    Row {
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 8
+
+                        Text {
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.windowRoot && root.windowRoot.ligatures ? "已开启" : "已关闭"
+                            color: Theme.textTertiary
+                            font.family: Theme.uiFont
+                            font.pixelSize: 10
+                        }
+
+                        Rectangle {
+                            id: ligatureSwitch
+                            width: 42
+                            height: 24
+                            radius: 12
+                            color: root.windowRoot && root.windowRoot.ligatures
+                                   ? Theme.accent : Theme.softTint
+                            border.width: 1
+                            border.color: root.windowRoot && root.windowRoot.ligatures
+                                          ? Qt.rgba(0.357, 0.608, 1, 0.5) : Theme.subtleBorder
+                            Behavior on color { ColorAnimation { duration: 120 } }
+
+                            Rectangle {
+                                width: 18
+                                height: 18
+                                radius: 9
+                                y: 3
+                                x: root.windowRoot && root.windowRoot.ligatures ? 21 : 3
+                                color: root.windowRoot && root.windowRoot.ligatures
+                                       ? "#ffffff" : Theme.textTertiary
+                                Behavior on x { NumberAnimation { duration: 120; easing.type: Easing.OutCubic } }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: {
+                                    if (root.windowRoot)
+                                        root.windowRoot.ligatures = !root.windowRoot.ligatures
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Item {
+                    width: parent.width
+                    height: 36
+
+                    Text {
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
                         text: "新标签 Shell"
                         color: Theme.textSecondary
                         font.family: Theme.uiFont
@@ -560,6 +621,7 @@ Item {
                             onClicked: {
                                 Theme.mode = "dark"
                                 root.windowRoot.terminalFontSize = 13
+                                root.windowRoot.ligatures = true
                                 Terminal.resetSettings()
                                 root.windowRoot.showToast("已恢复默认设置")
                             }

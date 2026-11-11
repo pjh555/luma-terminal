@@ -2,8 +2,12 @@
 
 #include <QByteArray>
 #include <QColor>
+#include <QElapsedTimer>
+#include <QHash>
+#include <QImage>
 #include <QObject>
 #include <QPointF>
+#include <QRect>
 #include <QString>
 #include <QTimer>
 #include <QVector>
@@ -67,10 +71,26 @@ public:
         bool current = false;
     };
 
+    struct ImagePlacement {
+        quint32 imageId = 0;
+        quint64 generation = 0;
+        int layer = GHOSTTY_RENDER_STATE_IMAGE_LAYER_BELOW_TEXT;
+        int z = 0;
+        int col = 0;
+        int row = 0;
+        int offsetX = 0;
+        int offsetY = 0;
+        int pixelWidth = 0;
+        int pixelHeight = 0;
+        QRect sourceRect;
+        QImage image;
+    };
+
     struct Snapshot {
         int cols = 80;
         int rows = 24;
         QVector<Row> rowsData;
+        QVector<ImagePlacement> images;
         QColor defaultFg;
         QColor cursorColor;
         bool cursorColorValid = false;
@@ -115,6 +135,7 @@ public:
     void restart();
     void resize(int rows, int cols, int cellWidthPx, int cellHeightPx);
     void setShellPath(const QString &path);
+    void setInitialCwd(const QString &path);
     void setScrollbackLines(int lines);
 
     Q_INVOKABLE void writeText(const QString &text);
@@ -190,6 +211,7 @@ private:
     void writeBytes(const QByteArray &data);
     void scheduleUpdate();
     void refreshSnapshot();
+    QImage kittyImage(quint32 imageId, quint64 generation);
     void updateTitleFromTerminal();
     void updatePwdFromTerminal();
     void pollCwd();
@@ -209,9 +231,15 @@ private:
 
     QString readTerminalString(GhosttyTerminalData data) const;
 
+    struct CachedImage {
+        quint64 generation = 0;
+        QImage image;
+    };
+
     QString m_id;
     QString m_shellPath;
     QString m_shellName;
+    QString m_initialCwd;
     QString m_title;
     QString m_cwd;
     QByteArray m_pasteData;
@@ -220,6 +248,7 @@ private:
     GhosttyRenderState m_renderState = nullptr;
     GhosttyRenderStateRowIterator m_rowIter = nullptr;
     GhosttyRenderStateRowCells m_cells = nullptr;
+    GhosttyRenderStateImageIterator m_imageIter = nullptr;
     GhosttyKeyEncoder m_keyEncoder = nullptr;
     GhosttyKeyEvent m_keyEvent = nullptr;
     GhosttyMouseEncoder m_mouseEncoder = nullptr;
@@ -243,7 +272,10 @@ private:
 
     QTimer *m_updateTimer = nullptr;
     QTimer *m_cwdTimer = nullptr;
+    QTimer *m_imageTimer = nullptr;
+    QElapsedTimer m_animationClock;
 
+    QHash<quint32, CachedImage> m_imageCache;
     Snapshot m_snapshot;
     bool m_hasSelection = false;
     int m_searchTotal = 0;

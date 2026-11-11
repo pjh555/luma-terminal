@@ -126,6 +126,16 @@ void TerminalView::setFontSize(int size)
     emit fontSizeChanged();
 }
 
+void TerminalView::setLigatures(bool enabled)
+{
+    if (m_ligatures == enabled)
+        return;
+    m_ligatures = enabled;
+    updateFontMetrics();
+    update();
+    emit ligaturesChanged();
+}
+
 void TerminalView::setActive(bool active)
 {
     if (m_active == active)
@@ -148,6 +158,13 @@ void TerminalView::updateFontMetrics()
     m_font.setKerning(false);
     m_font.setStyleStrategy(QFont::PreferAntialias);
     m_font.setHintingPreference(QFont::PreferFullHinting);
+    if (m_ligatures) {
+        m_font.setFeature(QFont::Tag("liga"), 1);
+        m_font.setFeature(QFont::Tag("calt"), 1);
+    } else {
+        m_font.setFeature(QFont::Tag("liga"), 0);
+        m_font.setFeature(QFont::Tag("calt"), 0);
+    }
 
     const QFontMetricsF fm(m_font);
     m_cellW = qMax(4.0, std::ceil(fm.horizontalAdvance(QLatin1Char('M'))));
@@ -691,6 +708,45 @@ QFont TerminalView::fontForCell(const TerminalSession::Cell &cell) const
     return font;
 }
 
+void TerminalView::paintImages(QPainter *painter,
+                               const TerminalSession::Snapshot &snapshot, int layer)
+{
+    const qreal scaleX = m_sentCellW > 0 ? m_cellW / m_sentCellW : 1.0;
+    const qreal scaleY = m_sentCellH > 0 ? m_cellH / m_sentCellH : 1.0;
+    const QRectF gridRect(m_padX, m_padY,
+                          snapshot.cols * m_cellW, snapshot.rows * m_cellH);
+
+    painter->save();
+    painter->setClipRect(gridRect);
+    painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+    for (const auto &image : snapshot.images) {
+        if (image.layer != layer || image.image.isNull())
+            continue;
+
+        const QRectF target(m_padX + image.col * m_cellW + image.offsetX * scaleX,
+                            m_padY + image.row * m_cellH + image.offsetY * scaleY,
+                            image.pixelWidth * scaleX,
+                            image.pixelHeight * scaleY);
+        if (target.width() <= 0 || target.height() <= 0)
+            continue;
+
+        QRectF source(image.sourceRect);
+        if (source.isEmpty()) {
+            source = QRectF(0, 0, image.image.width(), image.image.height());
+        } else {
+            source = source.intersected(QRectF(0, 0, image.image.width(),
+                                               image.image.height()));
+        }
+        if (source.isEmpty())
+            continue;
+
+        painter->drawImage(target, image.image, source);
+    }
+
+    painter->restore();
+}
+
 void TerminalView::paintBackgrounds(QPainter *painter,
                                     const TerminalSession::Snapshot &snapshot)
 {
@@ -939,8 +995,11 @@ void TerminalView::paint(QPainter *painter)
     }
 
     painter->setClipRect(boundingRect());
+    paintImages(painter, snapshot, GHOSTTY_RENDER_STATE_IMAGE_LAYER_BELOW_BACKGROUND);
     paintBackgrounds(painter, snapshot);
+    paintImages(painter, snapshot, GHOSTTY_RENDER_STATE_IMAGE_LAYER_BELOW_TEXT);
     paintText(painter, snapshot);
+    paintImages(painter, snapshot, GHOSTTY_RENDER_STATE_IMAGE_LAYER_ABOVE_TEXT);
     paintCursor(painter, snapshot);
     paintPreedit(painter, snapshot);
     painter->restore();

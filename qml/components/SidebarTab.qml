@@ -9,6 +9,8 @@ Item {
     property var tab
     property int tabIndex: 0
     property bool isActive: false
+    property bool dropTop: false
+    property bool dropBottom: false
 
     signal activated()
     signal closeRequested()
@@ -17,6 +19,45 @@ Item {
     signal moveDownRequested()
 
     height: 48
+
+    Drag.active: tabDrag.active
+    Drag.source: root
+    Drag.hotSpot: Qt.point(24, root.height / 2)
+    Drag.dragType: Drag.Automatic
+    Drag.supportedActions: Qt.MoveAction
+    Drag.keys: ["luma-tab"]
+    Drag.mimeData: ({ "text/plain": root.tab ? root.tab.id : "" })
+    Drag.onDragFinished: {
+        if (root.windowRoot)
+            root.windowRoot.tabDropSlot = -1
+    }
+    opacity: tabDrag.active ? 0.45 : 1.0
+    Behavior on opacity { NumberAnimation { duration: 100 } }
+
+    Rectangle {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: 8
+        anchors.rightMargin: 8
+        height: 2
+        radius: 1
+        color: Theme.accent
+        visible: root.dropTop
+        z: 4
+    }
+
+    Rectangle {
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.leftMargin: 8
+        anchors.rightMargin: 8
+        anchors.bottom: parent.bottom
+        height: 2
+        radius: 1
+        color: Theme.accent
+        visible: root.dropBottom
+        z: 4
+    }
 
     Rectangle {
         id: background
@@ -142,6 +183,13 @@ Item {
             } else {
                 root.activated()
             }
+        }
+
+        DragHandler {
+            id: tabDrag
+            target: null
+            acceptedButtons: Qt.LeftButton
+            cursorShape: Qt.ClosedHandCursor
         }
     }
 
